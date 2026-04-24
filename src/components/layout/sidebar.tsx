@@ -19,12 +19,14 @@ import {
   Sliders,
   GitBranch,
   ScrollText,
+  Handshake,
 } from 'lucide-react'
 
 const mainNavItems = [
   { href: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { href: '/customers', label: 'Customers', icon: Users },
   { href: '/invoices', label: 'Invoices', icon: FileText },
+  { href: '/promises', label: 'Promises', icon: Handshake },
   { href: '/collection-log', label: 'Collection Log', icon: Phone },
   { href: '/reports', label: 'Reports', icon: BarChart3 },
 ]

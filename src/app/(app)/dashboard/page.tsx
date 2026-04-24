@@ -13,6 +13,10 @@ import { PromiseToPayRequest, isPromiseExpired, daysUntilPromiseExpires } from '
 import { getDSOStatusColor, getDSOStatusLabel } from '@/lib/calculations/dso'
 import { CollectionTodoItem } from '@/lib/cadence/next-action'
 import { CommittedCashWeek } from '@/lib/db/promise-to-pay'
+import { YourWorkToday } from '@/components/dashboard/your-work-today'
+import { QuickActions } from '@/components/dashboard/quick-actions'
+import { CashPosition } from '@/components/dashboard/cash-position'
+import { MissingInvoicesAlert } from '@/components/dashboard/missing-invoices-alert'
 
 interface RepWorkload {
   repId: string
@@ -55,6 +59,19 @@ interface ARMetrics {
   repWorkload?: RepWorkload[]
 }
 
+interface WorkItem {
+  id: string
+  type: 'due-today' | 'due-this-week' | 'promised-due' | 'overdue-action'
+  title: string
+  subtitle?: string
+  amount: number
+  daysUntil?: number
+  priority: 'critical' | 'high' | 'medium'
+  customerId: string
+  invoiceNumber: string
+  invoiceId: string
+}
+
 export default function DashboardPage() {
   const { data: session } = useSession()
   const [metrics, setMetrics] = useState<ARMetrics | null>(null)
@@ -71,6 +88,8 @@ export default function DashboardPage() {
   const [collectorStats, setCollectorStats] = useState<any[]>([])
   const [committedCash, setCommittedCash] = useState<CommittedCashWeek[]>([])
   const [devUser, setDevUser] = useState<any>(null)
+  const [yourWorkTodayItems, setYourWorkTodayItems] = useState<WorkItem[]>([])
+  const [loadingWorkItems, setLoadingWorkItems] = useState(false)
 
   // Load dev user from localStorage (for testing without Google OAuth)
   useEffect(() => {
@@ -127,6 +146,25 @@ export default function DashboardPage() {
       console.error('Failed to load action queue:', error)
     } finally {
       setLoadingTodo(false)
+    }
+  }
+
+  async function loadYourWorkToday(repIdParam?: string) {
+    if (!repIdParam) return // Only for reps
+    setLoadingWorkItems(true)
+    try {
+      const url = new URL('/api/your-work-today', window.location.origin)
+      url.searchParams.set('repId', repIdParam)
+
+      const response = await fetch(url)
+      if (response.ok) {
+        const data = await response.json()
+        setYourWorkTodayItems(data.items)
+      }
+    } catch (error) {
+      console.error('Failed to load your work today:', error)
+    } finally {
+      setLoadingWorkItems(false)
     }
   }
 
@@ -226,6 +264,7 @@ export default function DashboardPage() {
     if (!isAdmin) {
       loadMetrics(repId)
       loadTodoList(repId)
+      loadYourWorkToday(repId)
     } else {
       loadMetrics(selectedRepId || undefined)
       loadTodoList(selectedRepId || undefined)
@@ -285,14 +324,26 @@ export default function DashboardPage() {
             onClick={() => {
               loadMetrics(isAdmin ? selectedRepId || undefined : repId)
               loadPromiseRequests()
+              if (!isAdmin) loadYourWorkToday(repId)
             }}
             className="text-slate-400 hover:text-slate-700 transition-colors"
             title="Refresh"
           >
-            <RefreshCw className={`h-4 w-4 ${loading || loadingPromises ? 'animate-spin' : ''}`} />
+            <RefreshCw className={`h-4 w-4 ${loading || loadingPromises || loadingWorkItems ? 'animate-spin' : ''}`} />
           </button>
         </div>
       </div>
+
+      {/* Missing Invoices Alert */}
+      {isAdmin && <MissingInvoicesAlert isAdmin={true} />}
+
+      {/* Your Work Today - Rep Only */}
+      {!isAdmin && (
+        <>
+          <YourWorkToday items={yourWorkTodayItems} loading={loadingWorkItems} />
+          <QuickActions />
+        </>
+      )}
 
       {/* Key Metrics */}
       <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
@@ -787,80 +838,15 @@ export default function DashboardPage() {
         </Card>
       )}
 
-      {/* ── Committed Cash Incoming (Admin Only) ─────────── */}
-      {isAdmin && committedCash.length > 0 && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <TrendingUp className="h-5 w-5 text-green-600" />
-              Committed Cash Incoming
-              <span className="text-sm font-normal text-slate-500 ml-1">
-                — from approved promises-to-pay
-              </span>
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-              {committedCash.map((week) => (
-                <div
-                  key={week.weekStart}
-                  className="p-4 rounded-lg border border-green-200 bg-green-50"
-                >
-                  <p className="text-xs font-semibold text-green-700 uppercase tracking-wide">
-                    {week.weekLabel}
-                  </p>
-                  <p className="text-2xl font-bold text-green-800 mt-1">
-                    ${(week.totalCommitted / 1000).toFixed(1)}K
-                  </p>
-                  <p className="text-xs text-green-600 mt-0.5">
-                    {week.promiseCount} promise{week.promiseCount !== 1 ? 's' : ''}
-                  </p>
-                  <div className="mt-2 space-y-1">
-                    {week.promises.map((p, i) => (
-                      <div key={i} className="text-xs text-green-700 flex justify-between">
-                        <span className="truncate">{p.customerName}</span>
-                        <span className="font-medium ml-2">${(p.amount / 1000).toFixed(1)}K</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              ))}
-            </div>
-            <p className="text-xs text-slate-500 mt-3">
-              Total committed: ${(committedCash.reduce((s, w) => s + w.totalCommitted, 0) / 1000).toFixed(1)}K across {committedCash.reduce((s, w) => s + w.promiseCount, 0)} active promises
-            </p>
-          </CardContent>
-        </Card>
-      )}
 
-      {/* Aging Breakdown - Show for Admin or for Rep's own data */}
-      {metrics && (isAdmin || !isAdmin) && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-lg">Aging Breakdown</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div className="grid grid-cols-3 gap-4">
-              <div className="p-4 bg-green-50 rounded-lg border border-green-200">
-                <p className="text-sm font-medium text-green-900">0–30 Days</p>
-                <p className="text-2xl font-bold text-green-600 mt-2">${(metrics.aging.bucket0_30.amount / 1000).toFixed(0)}K</p>
-                <p className="text-xs text-green-700 mt-1">{metrics.aging.bucket0_30.count} invoices</p>
-              </div>
-
-              <div className="p-4 bg-yellow-50 rounded-lg border border-yellow-200">
-                <p className="text-sm font-medium text-yellow-900">31–60 Days</p>
-                <p className="text-2xl font-bold text-yellow-600 mt-2">${(metrics.aging.bucket31_60.amount / 1000).toFixed(0)}K</p>
-                <p className="text-xs text-yellow-700 mt-1">{metrics.aging.bucket31_60.count} invoices</p>
-              </div>
-
-              <div className="p-4 bg-red-50 rounded-lg border border-red-200">
-                <p className="text-sm font-medium text-red-900">60+ Days</p>
-                <p className="text-2xl font-bold text-red-600 mt-2">${(metrics.aging.bucket60plus.amount / 1000).toFixed(0)}K</p>
-                <p className="text-xs text-red-700 mt-1">{metrics.aging.bucket60plus.count} invoices</p>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
+      {/* Cash Position - Consolidated view */}
+      {metrics && (
+        <CashPosition
+          totalOutstanding={metrics.totalOutstanding}
+          dso={metrics.dso}
+          aging={metrics.aging}
+          committedCash={committedCash}
+        />
       )}
 
       {/* Top Overdue */}
