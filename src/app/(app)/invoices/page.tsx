@@ -1,0 +1,512 @@
+'use client'
+
+import { useState, useEffect, useCallback } from 'react'
+import Link from 'next/link'
+import { Card } from '@/components/ui/card'
+import { Badge } from '@/components/ui/badge'
+import { Skeleton } from '@/components/ui/skeleton'
+import { FileText, Search, ChevronUp, ChevronDown, Handshake, AlertTriangle, CheckCircle2 } from 'lucide-react'
+import { PromiseToPayModal } from '@/components/shared/promise-to-pay-modal'
+import { useSession } from 'next-auth/react'
+import { buildUserInfo } from '@/lib/auth/user-roles'
+import { isPromiseExpired, daysUntilPromiseExpires } from '@/lib/db/promise-to-pay'
+
+type DisputeStatus = 'none' | 'disputed' | 'in_review' | 'resolved'
+
+interface Invoice {
+  id: string
+  invoiceNumber: string
+  customerId: string
+  customerName: string
+  companyName: string
+  assignedRepId: string
+  assignedRepName: string
+  segment: string
+  amount: number
+  dueDate: string
+  invoiceDate: string
+  status: string
+  daysOverdue: number
+  daysOutstanding: number
+  disputeStatus: DisputeStatus
+  excludeFromDSO: boolean
+}
+
+const statusColors: Record<string, string> = {
+  'Outstanding': 'bg-blue-100 text-blue-800',
+  'Partially Paid': 'bg-yellow-100 text-yellow-800',
+  'Paid': 'bg-green-100 text-green-800',
+  'Disputed': 'bg-red-100 text-red-800',
+  'Overdue': 'bg-red-200 text-red-900',
+}
+
+const segmentColors: Record<string, string> = {
+  'Bronze': 'bg-orange-100 text-orange-800',
+  'Silver': 'bg-slate-100 text-slate-800',
+  'Regular': 'bg-blue-100 text-blue-800',
+  'Hyper-care': 'bg-red-100 text-red-800',
+  'Finance Action': 'bg-purple-100 text-purple-800',
+}
+
+const REPS = [
+  { id: 'rep-001', name: 'Sajjad' },
+  { id: 'rep-002', name: 'Yuliia' },
+  { id: 'rep-003', name: 'Baz' },
+  { id: 'rep-004', name: 'Rakshita' },
+]
+
+const SEGMENTS = ['Bronze', 'Silver', 'Regular', 'Hyper-care', 'Finance Action']
+const STATUSES = ['Outstanding', 'Partially Paid', 'Paid', 'Disputed']
+const DISPUTE_STATUSES: { value: DisputeStatus; label: string; color: string }[] = [
+  { value: 'none',      label: 'No Dispute',  color: 'bg-slate-100 text-slate-600' },
+  { value: 'disputed',  label: 'Disputed',    color: 'bg-red-100 text-red-800' },
+  { value: 'in_review', label: 'In Review',   color: 'bg-orange-100 text-orange-800' },
+  { value: 'resolved',  label: 'Resolved',    color: 'bg-green-100 text-green-800' },
+]
+const AGING_BUCKETS = ['0-30', '31-60', '60+']
+
+export default function InvoicesPage() {
+  const { data: session } = useSession()
+  const [devUser, setDevUser] = useState<any>(null)
+
+  // Load dev user from localStorage (for testing without Google OAuth)
+  useEffect(() => {
+    const saved = localStorage.getItem('devUser')
+    if (saved) {
+      try {
+        setDevUser(JSON.parse(saved))
+      } catch (e) {
+        // Invalid JSON, ignore
+      }
+    }
+  }, [])
+
+  // Use dev user if available, otherwise use session
+  const email = devUser?.email || session?.user?.email
+  const name = devUser?.name || session?.user?.name
+
+  const userInfo = buildUserInfo(email, name, email || '')
+  const isAdmin = userInfo.role === 'admin'
+
+  const [invoices, setInvoices] = useState<Invoice[]>([])
+  const [loading, setLoading] = useState(true)
+  const [search, setSearch] = useState('')
+  const [status, setStatus] = useState('')
+  const [repId, setRepId] = useState<string>('')
+  const [promiseRequests, setPromiseRequests] = useState<any[]>([])
+
+  // Auto-set repId for reps after devUser or session loads
+  useEffect(() => {
+    if (!isAdmin && userInfo.repId) {
+      setRepId(userInfo.repId)
+    } else if (isAdmin) {
+      setRepId('')
+    }
+  }, [isAdmin, userInfo.repId])
+
+  // Load promise-to-pay requests to show on invoices
+  useEffect(() => {
+    const loadPromises = async () => {
+      try {
+        const response = await fetch('/api/promise-to-pay')
+        if (response.ok) {
+          const data = await response.json()
+          setPromiseRequests(data.requests || [])
+        }
+      } catch (error) {
+        console.error('Failed to load promise-to-pay requests:', error)
+      }
+    }
+    loadPromises()
+  }, [])
+  const [segment, setSegment] = useState('')
+  const [agingBucket, setAgingBucket] = useState('')
+  const [sortBy, setSortBy] = useState('dueDate')
+  const [sortOrder, setSortOrder] = useState('asc')
+  const [promiseModal, setPromiseModal] = useState<{
+    invoiceId: string
+    invoiceNumber: string
+    customerName: string
+    amount: number
+  } | null>(null)
+
+  async function updateDisputeStatus(invoiceId: string, disputeStatus: DisputeStatus) {
+    try {
+      await fetch(`/api/invoices/${invoiceId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ disputeStatus }),
+      })
+      // Optimistically update local state
+      setInvoices((prev) =>
+        prev.map((inv) => (inv.id === invoiceId ? { ...inv, disputeStatus } : inv))
+      )
+    } catch (error) {
+      console.error('Failed to update dispute status:', error)
+    }
+  }
+
+  const fetchInvoices = useCallback(async () => {
+    try {
+      setLoading(true)
+      const params = new URLSearchParams()
+      if (search) params.append('search', search)
+      if (status) params.append('status', status)
+      if (repId) params.append('repId', repId)
+      if (segment) params.append('segment', segment)
+      if (agingBucket) params.append('agingBucket', agingBucket)
+      params.append('sortBy', sortBy)
+      params.append('sortOrder', sortOrder)
+
+      const response = await fetch(`/api/invoices?${params.toString()}`)
+      if (response.ok) {
+        const data = await response.json()
+        setInvoices(data.invoices)
+      }
+    } catch (error) {
+      console.error('Failed to fetch invoices:', error)
+    } finally {
+      setLoading(false)
+    }
+  }, [search, status, repId, segment, agingBucket, sortBy, sortOrder])
+
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      fetchInvoices()
+    }, 300)
+    return () => clearTimeout(timer)
+  }, [fetchInvoices])
+
+  const toggleSort = (field: string) => {
+    if (sortBy === field) {
+      setSortOrder(sortOrder === 'asc' ? 'desc' : 'asc')
+    } else {
+      setSortBy(field)
+      setSortOrder('asc')
+    }
+  }
+
+  const SortIcon = ({ field }: { field: string }) => {
+    if (sortBy !== field) return <div className="w-4" />
+    return sortOrder === 'asc' ? (
+      <ChevronUp className="h-4 w-4 text-slate-600" />
+    ) : (
+      <ChevronDown className="h-4 w-4 text-slate-600" />
+    )
+  }
+
+  const getAmountColor = (daysOverdue: number) => {
+    if (daysOverdue > 60) return 'text-red-600 font-semibold'
+    if (daysOverdue > 30) return 'text-orange-600 font-semibold'
+    if (daysOverdue > 0) return 'text-yellow-600 font-semibold'
+    return 'text-green-600'
+  }
+
+  return (
+    <div className="flex-1 flex flex-col gap-6 p-6">
+      <div>
+        <h1 className="text-3xl font-bold text-slate-900">Outstanding Invoices</h1>
+        <p className="text-slate-600 mt-1">
+          {invoices.length} invoices • Total: ${invoices.reduce((sum, inv) => sum + inv.amount, 0).toLocaleString()}
+        </p>
+      </div>
+
+      {/* Status Legend */}
+      <div className="bg-slate-50 p-4 rounded-lg border border-slate-200">
+        <p className="text-xs font-semibold text-slate-600 uppercase mb-3">Status Legend</p>
+        <div className="flex flex-wrap gap-4">
+          {Object.entries(statusColors).map(([status, colors]) => (
+            <div key={status} className="flex items-center gap-2">
+              <div className={`px-3 py-1 rounded text-xs font-medium ${colors}`}>
+                {status}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Search */}
+      <div className="flex gap-2 bg-white p-4 rounded-lg border">
+        <Search className="h-5 w-5 text-slate-400 flex-shrink-0" />
+        <input
+          type="text"
+          placeholder="Search by invoice #, customer name, or company..."
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          className="flex-1 text-sm outline-none"
+        />
+      </div>
+
+      {/* Filters */}
+      <div className="flex flex-wrap gap-2">
+        <select
+          value={status}
+          onChange={(e) => setStatus(e.target.value)}
+          className="px-3 py-2 text-sm border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-400"
+        >
+          <option value="">All Status</option>
+          {STATUSES.map(s => (
+            <option key={s} value={s}>{s}</option>
+          ))}
+        </select>
+
+        <select
+          value={repId}
+          onChange={(e) => setRepId(e.target.value)}
+          className="px-3 py-2 text-sm border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-400"
+        >
+          <option value="">All Reps</option>
+          {REPS.map(rep => (
+            <option key={rep.id} value={rep.id}>{rep.name}</option>
+          ))}
+        </select>
+
+        <select
+          value={segment}
+          onChange={(e) => setSegment(e.target.value)}
+          className="px-3 py-2 text-sm border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-400"
+        >
+          <option value="">All Segments</option>
+          {SEGMENTS.map(seg => (
+            <option key={seg} value={seg}>{seg}</option>
+          ))}
+        </select>
+
+        <select
+          value={agingBucket}
+          onChange={(e) => setAgingBucket(e.target.value)}
+          className="px-3 py-2 text-sm border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-400"
+        >
+          <option value="">All Ages</option>
+          {AGING_BUCKETS.map(bucket => (
+            <option key={bucket} value={bucket}>{bucket} days overdue</option>
+          ))}
+        </select>
+
+        {(search || status || repId || segment || agingBucket) && (
+          <button
+            onClick={() => {
+              setSearch('')
+              setStatus('')
+              setRepId('')
+              setSegment('')
+              setAgingBucket('')
+            }}
+            className="px-3 py-2 text-sm text-blue-600 hover:bg-blue-50 rounded-md"
+          >
+            Clear filters
+          </button>
+        )}
+      </div>
+
+      {/* Table */}
+      <Card className="overflow-hidden">
+        <div className="overflow-x-auto">
+          <table className="w-full">
+            <thead>
+              <tr className="bg-slate-50 border-b">
+                <th className="text-left py-3 px-4 text-xs font-semibold text-slate-500 uppercase">
+                  <button
+                    onClick={() => toggleSort('invoiceNumber')}
+                    className="flex items-center gap-1 hover:text-slate-700"
+                  >
+                    Invoice #
+                    <SortIcon field="invoiceNumber" />
+                  </button>
+                </th>
+                <th className="text-left py-3 px-4 text-xs font-semibold text-slate-500 uppercase">
+                  <button
+                    onClick={() => toggleSort('customerName')}
+                    className="flex items-center gap-1 hover:text-slate-700"
+                  >
+                    Customer
+                    <SortIcon field="customerName" />
+                  </button>
+                </th>
+                <th className="text-left py-3 px-4 text-xs font-semibold text-slate-500 uppercase">Segment</th>
+                <th className="text-left py-3 px-4 text-xs font-semibold text-slate-500 uppercase">Rep</th>
+                <th className="text-right py-3 px-4 text-xs font-semibold text-slate-500 uppercase">
+                  <button
+                    onClick={() => toggleSort('amount')}
+                    className="flex items-center justify-end gap-1 hover:text-slate-700 w-full"
+                  >
+                    Amount
+                    <SortIcon field="amount" />
+                  </button>
+                </th>
+                <th className="text-left py-3 px-4 text-xs font-semibold text-slate-500 uppercase">
+                  <button
+                    onClick={() => toggleSort('dueDate')}
+                    className="flex items-center gap-1 hover:text-slate-700"
+                  >
+                    Due Date
+                    <SortIcon field="dueDate" />
+                  </button>
+                </th>
+                <th className="text-left py-3 px-4 text-xs font-semibold text-slate-500 uppercase">
+                  <button
+                    onClick={() => toggleSort('daysOverdue')}
+                    className="flex items-center gap-1 hover:text-slate-700"
+                  >
+                    Days Overdue
+                    <SortIcon field="daysOverdue" />
+                  </button>
+                </th>
+                <th className="text-left py-3 px-4 text-xs font-semibold text-slate-500 uppercase">Status</th>
+                <th className="text-left py-3 px-4 text-xs font-semibold text-slate-500 uppercase">Promise</th>
+                <th className="text-left py-3 px-4 text-xs font-semibold text-slate-500 uppercase">Dispute</th>
+                {!isAdmin && <th className="text-left py-3 px-4 text-xs font-semibold text-slate-500 uppercase">Actions</th>}
+              </tr>
+            </thead>
+            <tbody>
+              {loading ? (
+                [1, 2, 3, 4, 5].map(i => {
+                  const colCount = isAdmin ? 9 : 10
+                  return (
+                    <tr key={i} className="border-b">
+                      {Array.from({ length: colCount }).map((_, j) => (
+                        <td key={`skeleton-${i}-${j}`} className="py-3 px-4">
+                          <Skeleton className="h-4 w-full" />
+                        </td>
+                      ))}
+                    </tr>
+                  )
+                })
+              ) : invoices.length === 0 ? (
+                <tr>
+                  <td colSpan={isAdmin ? 9 : 10} className="py-8 px-4 text-center text-slate-500">
+                    No invoices found
+                  </td>
+                </tr>
+              ) : (
+                invoices.map(invoice => (
+                  <tr key={invoice.id} className="border-b hover:bg-slate-50 cursor-pointer">
+                    <td className="py-3 px-4">
+                      <Link href={`/customers/${invoice.customerId}`} className="text-sm font-medium text-blue-600 hover:underline">
+                        {invoice.invoiceNumber}
+                      </Link>
+                    </td>
+                    <td className="py-3 px-4">
+                      <div>
+                        <Link href={`/customers/${invoice.customerId}`} className="text-sm font-medium text-slate-900 hover:text-blue-600">
+                          {invoice.customerName}
+                        </Link>
+                        <p className="text-xs text-slate-500">{invoice.companyName}</p>
+                      </div>
+                    </td>
+                    <td className="py-3 px-4">
+                      <Badge className={`text-xs ${segmentColors[invoice.segment] || 'bg-slate-100 text-slate-800'}`}>
+                        {invoice.segment}
+                      </Badge>
+                    </td>
+                    <td className="py-3 px-4 text-sm text-slate-600">{invoice.assignedRepName}</td>
+                    <td className="py-3 px-4 text-right">
+                      <span className="text-sm font-medium text-slate-900">
+                        ${invoice.amount.toLocaleString()}
+                      </span>
+                    </td>
+                    <td className="py-3 px-4 text-sm text-slate-600">
+                      {new Date(invoice.dueDate).toLocaleDateString('en-CA', {
+                        month: 'short',
+                        day: 'numeric',
+                      })}
+                    </td>
+                    <td className={`py-3 px-4 text-sm font-medium ${getAmountColor(invoice.daysOverdue)}`}>
+                      {invoice.daysOverdue > 0 ? `${invoice.daysOverdue}d` : 'Current'}
+                    </td>
+                    <td className="py-3 px-4">
+                      <Badge className={`text-xs ${statusColors[invoice.status] || 'bg-slate-100 text-slate-800'}`}>
+                        {invoice.status}
+                      </Badge>
+                    </td>
+                    <td className="py-3 px-4 text-xs">
+                      {(() => {
+                        const promise = promiseRequests.find(p => p.invoiceId === invoice.id)
+                        if (!promise) return <span className="text-slate-400">—</span>
+                        if (promise.status === 'pending') {
+                          return <Badge className="bg-yellow-100 text-yellow-800 text-xs">Pending</Badge>
+                        }
+                        if (promise.status === 'approved') {
+                          const expired = isPromiseExpired(promise)
+                          const daysUntil = daysUntilPromiseExpires(promise)
+                          return (
+                            <div className="flex items-center gap-1">
+                              <Badge className={expired ? 'bg-red-100 text-red-800 text-xs' : daysUntil <= 3 ? 'bg-yellow-100 text-yellow-800 text-xs' : 'bg-green-100 text-green-800 text-xs'}>
+                                {expired ? 'Expired' : `${daysUntil}d`}
+                              </Badge>
+                            </div>
+                          )
+                        }
+                        if (promise.status === 'rejected') {
+                          return <Badge className="bg-red-100 text-red-800 text-xs">Rejected</Badge>
+                        }
+                      })()}
+                    </td>
+                    {/* Dispute Status */}
+                    <td className="py-3 px-4">
+                      {isAdmin ? (
+                        <select
+                          value={invoice.disputeStatus || 'none'}
+                          onChange={(e) => updateDisputeStatus(invoice.id, e.target.value as DisputeStatus)}
+                          className={`text-xs px-2 py-1 rounded border-0 font-medium cursor-pointer ${
+                            DISPUTE_STATUSES.find(d => d.value === invoice.disputeStatus)?.color || 'bg-slate-100 text-slate-600'
+                          }`}
+                        >
+                          {DISPUTE_STATUSES.map((d) => (
+                            <option key={d.value} value={d.value}>{d.label}</option>
+                          ))}
+                        </select>
+                      ) : (
+                        invoice.disputeStatus && invoice.disputeStatus !== 'none' ? (
+                          <Badge className={`text-xs ${DISPUTE_STATUSES.find(d => d.value === invoice.disputeStatus)?.color}`}>
+                            {DISPUTE_STATUSES.find(d => d.value === invoice.disputeStatus)?.label}
+                          </Badge>
+                        ) : (
+                          <span className="text-slate-400 text-xs">—</span>
+                        )
+                      )}
+                    </td>
+                    {!isAdmin && (
+                      <td className="py-3 px-4">
+                        <button
+                          onClick={() =>
+                            setPromiseModal({
+                              invoiceId: invoice.id,
+                              invoiceNumber: invoice.invoiceNumber,
+                              customerName: invoice.customerName,
+                              amount: invoice.amount,
+                            })
+                          }
+                          className="inline-flex items-center gap-1 px-2 py-1 text-xs bg-blue-100 text-blue-700 rounded hover:bg-blue-200 transition-colors"
+                          title="Request promise-to-pay from customer"
+                        >
+                          <Handshake className="h-3 w-3" />
+                          Promise
+                        </button>
+                      </td>
+                    )}
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </Card>
+
+      {/* Promise-to-Pay Modal */}
+      {promiseModal && (
+        <PromiseToPayModal
+          invoiceId={promiseModal.invoiceId}
+          invoiceNumber={promiseModal.invoiceNumber}
+          customerName={promiseModal.customerName}
+          amount={promiseModal.amount}
+          onClose={() => setPromiseModal(null)}
+          onSuccess={() => {
+            // Refresh invoices to show updated status
+            fetchInvoices()
+          }}
+        />
+      )}
+    </div>
+  )
+}
